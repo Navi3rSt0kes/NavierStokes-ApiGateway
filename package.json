@@ -9,7 +9,7 @@
     "start:users": "node services/users/server.js",
     "start:warehouse": "node services/warehouse/server.js",
     "start:ia": "node services/ia/server.js",
-    "test": "node --test"
+    "test": "node --test --test-isolation=none"
   },
   "engines": {
     "node": ">=18"

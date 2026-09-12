@@ -30,3 +30,9 @@ curl -X POST http://localhost:3000/api/ia/generate -H "content-type: application
 ```
 
 Los datos de users y warehouse se mantienen en memoria y se reinician al detener los servicios. Para integrar un proveedor de IA real, sustituye la respuesta de `services/ia/server.js` por su llamada autenticada.
+
+## Vercel y CI/CD
+
+Vercel ejecuta el gateway como una única función serverless (`api/index.js`) y conserva las mismas rutas públicas. Como los datos son volátiles en la implementación original, los usuarios e inventario pueden reiniciarse al crear una nueva instancia serverless; use una base de datos para persistencia.
+
+El workflow `.github/workflows/vercel.yml` ejecuta las pruebas en cada pull request y, al hacer push a `main`, despliega a producción. Para activar esa fase, configure los secretos de Actions `VERCEL_TOKEN`, `VERCEL_ORG_ID` y `VERCEL_PROJECT_ID`; el job de despliegue se omite de forma segura mientras falte el token.
