@@ -10,9 +10,21 @@
     "start:warehouse": "node services/warehouse/server.js",
     "start:ia": "node services/ia/server.js",
     "test": "node --test",
-    "test:sandbox": "node --test --test-isolation=none"
+    "test:sandbox": "node --test --test-isolation=none",
+    "seed": "node scripts/seed.js",
+    "test:integration": "node --env-file=.env --test"
   },
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.3",
+    "mongodb": "^6.21.0"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "mongodb": "^6.0.0"
   }
 }

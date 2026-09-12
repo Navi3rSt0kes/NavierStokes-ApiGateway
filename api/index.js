@@ -1,92 +1,35 @@
-const { randomUUID } = require('node:crypto');
+const { ObjectId } = require('mongodb');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { getCollections, getDatabase } = require('../lib/database');
+const { seedDatabase } = require('../lib/seed');
 
-// Vercel keeps a function instance warm when possible; this preserves the
-// original gateway's in-memory behavior, but it is not durable storage.
-const users = [];
-const items = [];
+const origins = (process.env.CORS_ORIGINS || 'http://localhost:5173').split(',').map((value) => value.trim()).filter(Boolean);
+const secret = () => { if (!process.env.JWT_SECRET) throw Object.assign(new Error('Autenticación no configurada'), { statusCode: 503 }); return process.env.JWT_SECRET; };
+function send(res, req, status, value) { const origin = req.headers.origin; if (origin && origins.includes(origin)) res.setHeader('access-control-allow-origin', origin); res.setHeader('vary', 'Origin'); res.setHeader('access-control-allow-methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS'); res.setHeader('access-control-allow-headers', 'content-type,authorization'); res.setHeader('content-type', 'application/json; charset=utf-8'); res.statusCode = status; res.end(status === 204 ? undefined : JSON.stringify(value)); }
+async function readBody(req) { if (req.body && typeof req.body === 'object') return req.body; let raw = ''; for await (const part of req) raw += part; if (!raw) return {}; try { return JSON.parse(raw); } catch { throw Object.assign(new Error('El cuerpo debe ser JSON válido'), { statusCode: 400 }); } }
+function serialize(value) { if (!value) return null; const { _id, passwordHash, ...rest } = value; return { id: _id.toString(), ...rest }; }
+function currentUser(req) { const token = req.headers.authorization; if (!token?.startsWith('Bearer ')) throw Object.assign(new Error('Autenticación requerida'), { statusCode: 401 }); try { return jwt.verify(token.slice(7), secret()); } catch { throw Object.assign(new Error('Token inválido o vencido'), { statusCode: 401 }); } }
+function admin(req) { const user = currentUser(req); if (user.role !== 'ADMIN') throw Object.assign(new Error('No tienes permiso para esta operación'), { statusCode: 403 }); return user; }
+function id(value) { return ObjectId.isValid(value) ? new ObjectId(value) : null; }
 
-function sendJson(response, status, body) {
-  response.statusCode = status;
-  response.setHeader('content-type', 'application/json; charset=utf-8');
-  response.setHeader('access-control-allow-origin', '*');
-  response.setHeader('access-control-allow-methods', 'GET,POST,PUT,DELETE,OPTIONS');
-  response.setHeader('access-control-allow-headers', 'content-type');
-  response.end(status === 204 ? undefined : JSON.stringify(body));
+async function handler(req, res) {
+  if (req.method === 'OPTIONS') return send(res, req, 204, {});
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`); const path = url.pathname;
+  if (path === '/health') { try { await getDatabase().command({ ping: 1 }); return send(res, req, 200, { status: 'ok', service: 'markecia-api', database: 'connected' }); } catch { return send(res, req, 503, { status: 'degraded', service: 'markecia-api', database: 'unavailable' }); } }
+  const { users, products, carts, orders } = await getCollections();
+  if (path === '/api/auth/login' && req.method === 'POST') { const { email, password } = await readBody(req); const user = await users.findOne({ email: String(email || '').toLowerCase() }); if (!user || !password || !(await bcrypt.compare(password, user.passwordHash))) return send(res, req, 401, { error: 'Credenciales inválidas' }); return send(res, req, 200, { token: jwt.sign({ sub: user._id.toString(), email: user.email, role: user.role }, secret(), { expiresIn: '8h' }), user: serialize(user) }); }
+  if (path === '/api/auth/me' && req.method === 'GET') { const user = currentUser(req); return send(res, req, 200, { user: serialize(await users.findOne({ _id: id(user.sub) })) }); }
+  if (path === '/api/products' && req.method === 'GET') { const q = url.searchParams.get('q') || ''; const category = url.searchParams.get('category'); const filter = { ...(category ? { category } : {}), ...(q ? { $or: ['name', 'brand', 'description'].map((field) => ({ [field]: { $regex: q, $options: 'i' } })) } : {}) }; return send(res, req, 200, { products: (await products.find(filter).sort({ name: 1 }).toArray()).map(serialize) }); }
+  const productKey = path.match(/^\/api\/products\/([^/]+)$/)?.[1];
+  if (productKey && req.method === 'GET') { const product = await products.findOne({ $or: [{ sku: productKey }, { _id: id(productKey) }] }); return product ? send(res, req, 200, { product: serialize(product) }) : send(res, req, 404, { error: 'Producto no encontrado' }); }
+  if (path === '/api/products' && req.method === 'POST') { admin(req); const product = await readBody(req); if (!product.sku || !product.name || !Number.isFinite(product.price) || !Number.isInteger(product.stock)) return send(res, req, 400, { error: 'sku, name, price y stock son obligatorios' }); product.available = product.stock > 0; product.createdAt = new Date(); product.updatedAt = new Date(); try { await products.insertOne(product); return send(res, req, 201, { product: serialize(product) }); } catch { return send(res, req, 409, { error: 'SKU ya existe' }); } }
+  if (path === '/api/cart' && req.method === 'GET') { const user = currentUser(req); const cart = await carts.findOne({ userId: id(user.sub) }); return send(res, req, 200, { cart: serialize(cart) || { items: [] } }); }
+  if (path === '/api/cart/items' && req.method === 'PUT') { const user = currentUser(req); const { items } = await readBody(req); if (!Array.isArray(items) || items.some((item) => !id(item.productId) || !Number.isInteger(item.quantity) || item.quantity < 1)) return send(res, req, 400, { error: 'items inválidos' }); const found = await products.find({ _id: { $in: items.map((item) => id(item.productId)) } }).toArray(); if (found.length !== items.length || items.some((item) => { const product = found.find((entry) => entry._id.equals(id(item.productId))); return !product || product.stock < item.quantity; })) return send(res, req, 409, { error: 'Inventario insuficiente' }); const stored = items.map((item) => { const product = found.find((entry) => entry._id.equals(id(item.productId))); return { productId: product._id, name: product.name, price: product.price, quantity: item.quantity }; }); await carts.updateOne({ userId: id(user.sub) }, { $set: { items: stored, updatedAt: new Date() }, $setOnInsert: { userId: id(user.sub), createdAt: new Date() } }, { upsert: true }); return send(res, req, 200, { cart: { items: stored.map((item) => ({ ...item, productId: item.productId.toString() })) } }); }
+  if (path === '/api/orders' && req.method === 'POST') { const user = currentUser(req); const cart = await carts.findOne({ userId: id(user.sub) }); if (!cart?.items?.length) return send(res, req, 400, { error: 'El carrito está vacío' }); const order = { reference: `MK-${Date.now()}`, userId: id(user.sub), items: cart.items, total: cart.items.reduce((sum, item) => sum + item.price * item.quantity, 0), status: 'RECIBIDO', createdAt: new Date() }; for (const item of cart.items) { if (!(await products.updateOne({ _id: item.productId, stock: { $gte: item.quantity } }, { $inc: { stock: -item.quantity }, $set: { updatedAt: new Date() } })).modifiedCount) return send(res, req, 409, { error: 'Inventario actualizado; revisa el carrito' }); } await orders.insertOne(order); await carts.updateOne({ _id: cart._id }, { $set: { items: [], updatedAt: new Date() } }); return send(res, req, 201, { order: serialize(order) }); }
+  if (path === '/api/orders' && req.method === 'GET') { const user = currentUser(req); const filter = user.role === 'ADMIN' ? {} : { userId: id(user.sub) }; return send(res, req, 200, { orders: (await orders.find(filter).sort({ createdAt: -1 }).toArray()).map(serialize) }); }
+  if (path === '/api/agent/chat' && req.method === 'POST') { const { message } = await readBody(req); if (!message || typeof message !== 'string') return send(res, req, 400, { error: 'message es obligatorio' }); const terms = message.split(/\s+/).filter((term) => term.length > 2).slice(0, 8); const recommendations = (await products.find({ available: true, $or: terms.flatMap((term) => ['name', 'description', 'category'].map((field) => ({ [field]: { $regex: term, $options: 'i' } }))) }).limit(6).toArray()).map(serialize); return send(res, req, 200, { response: recommendations.length ? `Encontré ${recommendations.map((product) => product.name).join(', ')} disponibles.` : 'No encontré productos disponibles para esa solicitud.', recommendations }); }
+  if (path === '/api/admin/seed' && req.method === 'POST') { admin(req); await seedDatabase(); return send(res, req, 200, { status: 'ok' }); }
+  return send(res, req, 404, { error: 'Ruta no encontrada' });
 }
-
-function readBody(request) {
-  if (request.body && typeof request.body === 'object') return Promise.resolve(request.body);
-  return new Promise((resolve, reject) => {
-    let raw = '';
-    request.on('data', (chunk) => { raw += chunk; });
-    request.on('end', () => {
-      if (!raw) return resolve({});
-      try { resolve(JSON.parse(raw)); } catch { reject(new Error('El cuerpo debe ser JSON válido')); }
-    });
-    request.on('error', reject);
-  });
-}
-
-function notFound(response) {
-  sendJson(response, 404, { error: 'Ruta no encontrada' });
-}
-
-module.exports = async (request, response) => {
-  if (request.method === 'OPTIONS') return sendJson(response, 204, {});
-  const pathname = new URL(request.url, `http://${request.headers.host || 'localhost'}`).pathname;
-
-  if (pathname === '/health') return sendJson(response, 200, { status: 'ok', service: 'gateway' });
-  if (pathname === '/api/users/health') return sendJson(response, 200, { status: 'ok', service: 'users' });
-  if (pathname === '/api/warehouse/health') return sendJson(response, 200, { status: 'ok', service: 'warehouse' });
-  if (pathname === '/api/ia/health') return sendJson(response, 200, { status: 'ok', service: 'ia' });
-
-  if (pathname === '/api/users/users' && request.method === 'GET') return sendJson(response, 200, users);
-  if (pathname === '/api/users/users' && request.method === 'POST') {
-    try {
-      const { name, email } = await readBody(request);
-      if (!name || !email) return sendJson(response, 400, { error: 'name y email son obligatorios' });
-      const user = { id: randomUUID(), name, email };
-      users.push(user);
-      return sendJson(response, 201, user);
-    } catch (error) { return sendJson(response, 400, { error: error.message }); }
-  }
-
-  const userId = pathname.match(/^\/api\/users\/users\/([^/]+)$/)?.[1];
-  if (userId && request.method === 'GET') {
-    const user = users.find((entry) => entry.id === userId);
-    return user ? sendJson(response, 200, user) : sendJson(response, 404, { error: 'Usuario no encontrado' });
-  }
-
-  if (pathname === '/api/warehouse/items' && request.method === 'GET') return sendJson(response, 200, items);
-  if (pathname === '/api/warehouse/items' && request.method === 'POST') {
-    try {
-      const { name, quantity } = await readBody(request);
-      if (!name || !Number.isFinite(quantity) || quantity < 0) return sendJson(response, 400, { error: 'name y quantity (>= 0) son obligatorios' });
-      const item = { id: randomUUID(), name, quantity };
-      items.push(item);
-      return sendJson(response, 201, item);
-    } catch (error) { return sendJson(response, 400, { error: error.message }); }
-  }
-
-  const itemId = pathname.match(/^\/api\/warehouse\/items\/([^/]+)$/)?.[1];
-  if (itemId && request.method === 'PUT') {
-    try {
-      const item = items.find((entry) => entry.id === itemId);
-      if (!item) return sendJson(response, 404, { error: 'Producto no encontrado' });
-      const { quantity } = await readBody(request);
-      if (!Number.isFinite(quantity) || quantity < 0) return sendJson(response, 400, { error: 'quantity debe ser un número >= 0' });
-      item.quantity = quantity;
-      return sendJson(response, 200, item);
-    } catch (error) { return sendJson(response, 400, { error: error.message }); }
-  }
-
-  if (pathname === '/api/ia/generate' && request.method === 'POST') {
-    try {
-      const { prompt } = await readBody(request);
-      if (!prompt || typeof prompt !== 'string') return sendJson(response, 400, { error: 'prompt es obligatorio' });
-      return sendJson(response, 200, { response: `Respuesta simulada para: ${prompt}`, provider: 'local-mock' });
-    } catch (error) { return sendJson(response, 400, { error: error.message }); }
-  }
-
-  return notFound(response);
-};
+module.exports = (req, res) => handler(req, res).catch((error) => send(res, req, error.statusCode || 500, { error: error.statusCode ? error.message : 'Error interno del servidor' }));
