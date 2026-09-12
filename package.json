@@ -1,0 +1,17 @@
+{
+  "name": "navierstokes-api-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Gateway y microservicios mínimos de users, warehouse e IA.",
+  "scripts": {
+    "start": "node scripts/start-all.js",
+    "start:gateway": "node gateway/server.js",
+    "start:users": "node services/users/server.js",
+    "start:warehouse": "node services/warehouse/server.js",
+    "start:ia": "node services/ia/server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
